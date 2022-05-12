@@ -1,250 +1,260 @@
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <algorithm>
+
+#include "config.h"
+#include "arena.h"
 #include "Allocator.h"
 
-Allocator::Allocator(size_t size)
-{
-    HEADER_SIZE = sizeof(header);
-    MEM_ALIGNMENT = 4;
+#define DEBUG_MODE 1
 
-    void* ptr = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    start_ptr = (uint8_t*)ptr + HEADER_SIZE;
-    end_ptr = (uint8_t*)ptr + size;
+using namespace std;
 
-    start_block = (header*)ptr;
-    start_block->_prev_size = NULL;
-    start_block->_size = size - HEADER_SIZE;
+static block_tree tree;
+#if DEBUG_MODE
+static int count_arena;
+static void* arenas[1000];
+#endif
 
-    set_state(start_block, false);
+/**
+ * Function that prints information about block
+ * 
+ * size_t id - number of block (0 for tree blocks)
+ * void* ptr - pointer to block
+*/
+static void print_tree_data(size_t id, void* ptr) {
+    printf(" %10zu | %10c | %10p | %10zu | %10zu | %10p | %10d | %10d\n",
+        id,
+        is_free(ptr) ? 'F' : 'B',
+        payload_to_block(ptr),
+        get_block_size(ptr),
+        get_block_prev_size(ptr),
+        ptr,
+        get_FAB(ptr),
+        get_LAB(ptr));
 }
 
-Allocator::~Allocator()
-{
-    VirtualFree(start_ptr, 0, MEM_RELEASE);
-}
+#if DEBUG_MODE
+/**
+ * Show all blocks in each arena
+ * allocated with this allocator
+*/
+void mem_show(){
+    printf("=== ARENAS DATA START ===\n");
 
-void Allocator::show(){
-    uint8_t*ptr = (uint8_t*)start_ptr;
-    size_t i = 0;
-    printf("N\tSTATE\tHEADER\t\tSIZE\tP_SIZE\tPTR\n\n");
-    while (ptr != NULL && ptr < end_ptr) {
-        header *tmp_header = (header*)(ptr - HEADER_SIZE);
+    void* ptr = NULL;
 
-        printf("%d\t%c\t%p\t%d\t%d\t%p\n\n", i, (tmp_header->_size & 1)? 'B':'F', 
-            tmp_header, get_header_size(tmp_header), tmp_header->_prev_size, ptr);
-
-        ptr += get_header_size(tmp_header) + HEADER_SIZE;
-        i++;
+    if (count_arena == 0) {
+        printf("No arenas were allocated.\n");
+        return;
     }
+    
+    for (int j = 0; j < count_arena; j++) {
+        ptr = arenas[j];
+
+        if (ptr == NULL) {
+            printf("No blocks were allocated.\n");
+            continue;
+        }
+
+        size_t i = 0;
+        printf(" %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s\n\n",
+            "N", "STATE", "HEADER", "SIZE", "P_SIZE", "PTR", "IS_FIRST", "IS_LAST");
+        do {
+            print_tree_data(i, ptr);
+
+            if (get_LAB(ptr))
+                break;
+            ptr = block_next(ptr);
+            i++;
+        } while (1);
+
+        printf("\n");
+    }
+
+    printf("===  ARENAS DATA END  ===\n\n");
+}
+#endif
+
+/**
+ * Show tree of free blocks
+ * at this moment
+*/
+void mem_tree_show() {
+    printf("===  TREE DATA START  ===\n\n");
+    if (block_tree_is_empty(&tree))
+        printf("Tree is empty.\n");
+    else {
+        printf(" %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s\n\n",
+            "N", "STATE", "HEADER", "SIZE", "P_SIZE", "PTR", "IS_FIRST", "IS_LAST");
+        avl_traverse(&tree, print_tree_data);
+        printf("\n");
+    }
+    printf("===   TREE DATA END   ===\n\n");
 }
 
-void *Allocator::malloc(size_t size) {
-    uint8_t* ptr = (uint8_t*)start_ptr;
-    size_t size_align = (size % MEM_ALIGNMENT != 0)? size - (size % MEM_ALIGNMENT) + MEM_ALIGNMENT: size;
+/**
+ * Allocate memory with size
+ * return pointer to memory
+ *
+ * size_t size - size for getting memory
+*/
+void *mem_alloc(size_t size) {
+    size_t size_align = max(ROUND_BYTES(size), NODE_SIZE);
 
-    while (ptr < end_ptr) {
-        header *tmp_header = (header*)(ptr - HEADER_SIZE);
-        if (is_free(tmp_header) && tmp_header->_size >= size_align) {
-            // divide to Busy and Free blocks
-            if (tmp_header->_size > size_align + HEADER_SIZE) {
-                header* rest_free = (header*)(ptr + size_align);
-                rest_free->_prev_size = size_align;
-                rest_free->_size = tmp_header->_size - size_align - HEADER_SIZE;
-                set_state(rest_free, false);
+    void* fitted = best_fit(&tree, size_align);
+    if (fitted == NULL) {
+        void* ptr = arena_create(size_align, &tree);
+#if DEBUG_MODE
+        arenas[count_arena++] = ptr;
+#endif
+        if (ptr == NULL)
+            return NULL;
+        fitted = ptr;
+    }
 
-                if (ptr + tmp_header->_size + HEADER_SIZE < end_ptr &&
-                    ptr + tmp_header->_size + HEADER_SIZE != NULL) {
-                    header* tmp_next = (header*)(ptr + tmp_header->_size);
-                    tmp_next->_prev_size = rest_free->_size;
+    void* removed = block_tree_del(&tree, fitted);
+
+    if ((!get_LAB(removed) && is_free(block_next(removed))) ||
+        get_block_size(removed) - size_align >= HEADER_SIZE + NODE_SIZE) {
+        void* rest = block_split(removed, size_align);
+
+        if (rest != NULL) {
+            if (!get_LAB(rest) && is_free(block_next(rest)))
+                block_merge(&tree, rest);
+
+            block_tree_init_add(&tree, rest, get_block_size(rest));
+        }
+    }
+
+    set_busy(removed, true);
+
+    return removed;
+}
+
+/**
+ * Re-allocate memory with new size
+ * return pointer to new memory
+ *
+ * void* ptr - pointer to block for reallocating
+ * size_t size - new size for block
+*/
+void* mem_realloc(void* ptr, size_t size) {
+    if (ptr == NULL) {
+        return mem_alloc(size);
+    }
+
+    if (size == 0 || is_free(ptr)) {
+        return NULL;
+    }
+
+    size_t size_align = max(ROUND_BYTES(size), NODE_SIZE);
+
+    // realloc BIG blocks
+    if (get_block_size(ptr) > ARENA_BLOCK_SIZE_MAX) {
+        void* new_ptr = mem_alloc(size_align);
+
+        if (new_ptr == NULL) {
+            return NULL;
+        }
+
+        memcpy(ptr, new_ptr, min(get_block_size(new_ptr), get_block_size(ptr)));
+
+        mem_free(ptr);
+
+        return new_ptr;
+    }
+
+    // decrease size
+    if (size_align < get_block_size(ptr)) {
+        if ((!get_LAB(ptr) && is_free(block_next(ptr))) ||
+            get_block_size(ptr) - size_align >= HEADER_SIZE + NODE_SIZE) {
+            void* new_ptr = block_split(ptr, size_align);
+            if (new_ptr != NULL) {
+                if (!get_LAB(new_ptr) && is_free(block_next(new_ptr))) {
+                    block_tree_del(&tree, block_next(new_ptr));
+                    block_merge(&tree, new_ptr);
                 }
-
-                tmp_header->_size = size_align;
+                block_tree_init_add(&tree, new_ptr, get_block_size(new_ptr));
             }
-            set_state(tmp_header, true);
+        }
+        return ptr;
+    }
+
+    // increase size
+    if (size_align > get_block_size(ptr)) {
+        // merge with next
+        if (!get_LAB(ptr) && is_free(block_next(ptr)) &&
+            get_block_size(block_next(ptr)) + get_block_size(ptr) + HEADER_SIZE >= size_align) {
+            block_tree_del(&tree, block_next(ptr));
+
+            if ((!get_LAB(block_next(ptr)) && is_free(block_next(block_next(ptr)))) ||
+                get_block_size(block_next(ptr)) - (size_align - get_block_size(ptr)) >= NODE_SIZE) {
+                void* splitted2 = block_split(block_next(ptr), size_align - HEADER_SIZE - get_block_size(ptr));
+                if (splitted2 != NULL) {
+                    if (!get_LAB(splitted2) && is_free(block_next(splitted2))) {
+                        block_tree_del(&tree, block_next(splitted2));
+                        block_merge(&tree, splitted2);
+                    }
+                    block_tree_init_add(&tree, splitted2, get_block_size(splitted2));
+                }
+            }
+
+            block_merge(&tree, ptr);
             return ptr;
         }
 
-        // try next block
-        ptr += get_header_size(tmp_header) + HEADER_SIZE;
-    }
-    return NULL;
-}
+        void* new_ptr = mem_alloc(size_align);
 
-void* Allocator::realloc(void* ptr, size_t size) {
-    header* tmp_header = (header*)((uint8_t*)ptr - HEADER_SIZE);
-
-    if (ptr == NULL) {
-        return malloc(size);
-    }
-
-    if (size == 0) {
-        return NULL;
-    }
-
-    size_t size_align = (size % MEM_ALIGNMENT != 0) ? size - (size % MEM_ALIGNMENT) + MEM_ALIGNMENT : size;
-    if (size_align == get_header_size(tmp_header)) {
-        return ptr;
-    }
-    else {
-        // decrease size
-        if (size_align <= get_header_size(tmp_header)) {
-            return decrease_block_size(ptr, tmp_header, size_align);
+        if (new_ptr == NULL) {
+            return NULL;
         }
-        // increase size
-        if (size_align > get_header_size(tmp_header)) {
-            return increase_block_size(ptr, tmp_header, size_align);
-        }
-    }
-}
 
-void* Allocator::decrease_block_size(void* prev_ptr, header* prev_header, size_t size_align) {
-    if (size_align + HEADER_SIZE >= get_header_size(prev_header)) {
-        return prev_ptr;
+        memcpy(ptr, new_ptr, get_block_size(ptr));
+
+        mem_free(ptr);
+
+        return new_ptr;
     }
 
-    uint8_t* ptr = (uint8_t*)prev_ptr;
-    header* rest_free = (header*)(ptr + size_align);
-    
-    rest_free->_prev_size = size_align;
-    rest_free->_size = get_header_size(prev_header) - size_align - HEADER_SIZE;
-    set_state(rest_free, false);
-
-    if (ptr + get_header_size(prev_header) + HEADER_SIZE < end_ptr && 
-        ptr + get_header_size(prev_header) + HEADER_SIZE != NULL) {
-        header *tmp_next = (header*)(ptr + get_header_size(prev_header));
-        tmp_next->_prev_size = rest_free->_size;
-    }
-
-    prev_header->_size = size_align;
-    set_state(prev_header, true);
-
-    // merge rest_free block with free neighbour
-    merge_free((uint8_t*)rest_free + HEADER_SIZE, rest_free);
-
+    // equal size
     return ptr;
 }
 
-void* Allocator::increase_block_size(void* prev_ptr, header* prev_header, size_t size_align) {
-    uint8_t* prev_n_ptr = (uint8_t*)prev_ptr - prev_header->_prev_size - HEADER_SIZE;
-    header* prev_n_header = (header*)((uint8_t*)prev_n_ptr - HEADER_SIZE);
-
-    uint8_t* next_ptr = (uint8_t*)prev_ptr + get_header_size(prev_header) + HEADER_SIZE;
-    header* next_header = (header*)(next_ptr - HEADER_SIZE);
-
-    // merge with next
-    if (next_ptr < end_ptr && next_ptr != NULL && 
-        is_free(next_header) && next_header->_size + get_header_size(prev_header) >= size_align) {
-        // divide to Busy and Free blocks
-        if (next_header->_size + get_header_size(prev_header) > size_align) {
-            header* rest_free = (header*)((uint8_t*)prev_ptr + size_align);
-            rest_free->_prev_size = size_align;
-            rest_free->_size = next_header->_size + get_header_size(prev_header) - size_align;
-            set_state(rest_free, false);
-
-            if (next_ptr + get_header_size(next_header) + HEADER_SIZE < end_ptr &&
-                next_ptr + get_header_size(next_header) + HEADER_SIZE != NULL) {
-                header* tmp_next = (header*)(next_ptr + get_header_size(next_header));
-                tmp_next->_prev_size = rest_free->_size;
-            }
-        }
-        else {
-            if (next_ptr + get_header_size(next_header) + HEADER_SIZE < end_ptr &&
-                next_ptr + get_header_size(next_header) + HEADER_SIZE != NULL) {
-                header* tmp_next = (header*)(next_ptr + get_header_size(next_header));
-                tmp_next->_prev_size = size_align;
-            }
-        }
-
-        prev_header->_size = size_align;
-        set_state(prev_header, true);
-        return prev_ptr;
-    }
-
-    // merge with previous
-    if (is_free(prev_n_header) && prev_n_header->_size + get_header_size(prev_header) >= size_align) {
-        // divide to Busy and Free blocks
-        if (prev_n_header->_size + get_header_size(prev_header) > size_align + HEADER_SIZE) {
-            header* rest_free = (header*)((uint8_t*)prev_n_ptr + size_align);
-            rest_free->_prev_size = size_align;
-            rest_free->_size = prev_n_header->_size + get_header_size(prev_header) - size_align - HEADER_SIZE;
-            set_state(rest_free, false);
-
-            if ((uint8_t*)prev_ptr + get_header_size(prev_header) + HEADER_SIZE < end_ptr &&
-                (uint8_t*)prev_ptr + get_header_size(prev_header) + HEADER_SIZE != NULL) {
-                header* tmp_next = (header*)((uint8_t*)prev_ptr + get_header_size(prev_header));
-                tmp_next->_prev_size = rest_free->_size;
-            }
-
-            prev_n_header->_size = size_align;
-        }
-        set_state(prev_n_header, true);
-
-        copy_data(prev_ptr, prev_n_ptr, get_header_size(prev_header));
-
-        return prev_n_ptr;
-    }
-
-    void* new_ptr = malloc(size_align);
-    
-    if (new_ptr == NULL) {
-        return NULL;
-    }
-
-    copy_data(prev_ptr, new_ptr, get_header_size(prev_header));
-
-    free(prev_ptr);
-
-    return new_ptr;
-}
-
-void Allocator::copy_data(void* old_ptr, void* new_ptr, size_t len) {
-    uint8_t delta = 0;
-    uint8_t* new_data = (uint8_t*)new_ptr, * old_data = (uint8_t*)old_ptr;
-
-    for (size_t i = 0; i < len; i++)
-        *new_data = *old_data;
-}
-
-void Allocator::free(void *ptr) {
+/**
+ * Make memory free
+ *
+ * void* ptr - pointer to block for making it free
+*/
+void mem_free(void *ptr) {
     if (ptr != NULL) {
-        header* tmp_header = (header*)((uint8_t*)ptr - HEADER_SIZE);
-        set_state(tmp_header, false);
+        set_busy(ptr, false);
 
-        // merge free block with free neighbour
-        merge_free((uint8_t*)ptr, tmp_header);
-    }
-}
+        // merge free block with free next neighbour
+        if (!get_LAB(ptr) && is_free(block_next(ptr))) {
+            block_tree_del(&tree, block_next(ptr));
+            block_merge(&tree, ptr);
+        }
 
-void Allocator::merge_free(void* current_ptr, header* current_header) {
-    // merge with next
-    header* next_header = (header*)((uint8_t*)current_ptr + get_header_size(current_header));
-    if (next_header + HEADER_SIZE < end_ptr && next_header + HEADER_SIZE != NULL && is_free(next_header)) {
-        current_header->_size += next_header->_size + HEADER_SIZE;
+        // merge free block with free previous neighbour
+        if (!get_FAB(ptr) && is_free(block_prev(ptr))) {
+            block_tree_del(&tree, block_prev(ptr));
+            block_merge(&tree, block_prev(ptr));
+            ptr = block_prev(ptr);
+        }
 
-        if ((uint8_t*)current_ptr + get_header_size(current_header) + HEADER_SIZE < end_ptr &&
-            (uint8_t*)current_ptr + get_header_size(current_header) + HEADER_SIZE != NULL) {
-            header *tmp_next = (header*)((uint8_t*)current_ptr + get_header_size(current_header));
-            tmp_next->_prev_size = current_header->_size;
+        block_tree_init_add(&tree, ptr, get_block_size(ptr));
+
+        if (get_FAB(ptr) && get_LAB(ptr)) {
+            block_tree_del(&tree, ptr);
+            arena_remove(payload_to_arena(ptr));
+#if DEBUG_MODE
+            for (int i = 0; i < count_arena; i++)
+                if (arenas[i] == ptr)
+                    arenas[i] = NULL;
+#endif
         }
     }
-
-    // merge with previous
-    uint8_t* prev_ptr = (uint8_t*)current_ptr - current_header->_prev_size - HEADER_SIZE;
-    header* prev_header = (header*)(prev_ptr - HEADER_SIZE);
-    if (prev_ptr >= start_ptr && is_free(prev_header))
-        merge_free(prev_ptr, prev_header);
-}
-
-// set block busyness: 0 - free, 1 - busy
-void Allocator::set_state(header *header, bool state) {
-    if (state) // set 1
-        header->_size |= 1;
-    else // set 0
-        header->_size &= ~1;
-}
-
-bool Allocator::is_free(header *header) {
-    return !(header->_size & 1);
-}
-
-size_t Allocator::get_header_size(header *header) {
-    return  header->_size & ~1;
 }

@@ -1,37 +1,147 @@
 #include <iostream>
 #include <time.h>
+
 #include "Allocator.h"
+#include "arena.h"
 
-void tester(size_t allocator_mem, size_t random_mem, int iterations) {
-    Allocator my_allocator = Allocator(allocator_mem);
-    void *ptr_arr[10000] = { NULL };
-    int iterator = 1;
+#define G   *(1073741824)
+#define M   *(1048576)
+#define K   *(1024)
 
-    for (int i = 0; i < iterations; i++) {
-        void* tmp_ptr;
-        switch (rand() % 3) {
-        case 0: ptr_arr[rand() % iterator] = my_allocator.malloc(rand() % (random_mem+1)); 
-                iterator++; break;
+using namespace std;
 
-        case 1: my_allocator.free(ptr_arr[rand() % iterator]); 
-                break;
+const int PTR_ARR_SIZE = 10000;
 
-        case 2: int tmp_iter = rand() % iterator;
-                ptr_arr[tmp_iter] = my_allocator.realloc(ptr_arr[tmp_iter], rand() % (random_mem+1));
-        }
-        my_allocator.show(); 
-        cout << endl;
-    }
-    /*void *p = my_allocator.malloc(12);
-    void *q = my_allocator.malloc(20);
-    void *pp = my_allocator.malloc(8);
-    my_allocator.free(q);
-    my_allocator.realloc(q, 8);*/
-}
+struct mem_block {
+    void* _ptr;
+    size_t _size;
+    uint32_t _checksum;
+};
+
+static uint32_t checksum(void* ptr, size_t size);
+static uint32_t fill_data(void* ptr, size_t size);
+static void tester(size_t random_mem, int iterations);
 
 int main()
 {
-    srand(time(NULL));
-    tester(4096*10, 1024, 1000);
+    time_t t = time(NULL);
+    srand(t);
+
+#if 0
+    void* tt = malloc(sizeof(header));
+    setters(tt, ROUND_BYTES_GENERIC(12345), ROUND_BYTES_GENERIC(5431), 1, 1, 1);
+    printf("%10d |%10c |%10p |%10llu |%10llu |%10p |%10d |%10d\n",
+        0,
+        is_free(tt) ? 'F' : 'B',
+        payload_to_block(tt),
+        get_block_size(tt),
+        get_block_prev_size(tt),
+        tt,
+        get_FAB(tt),
+        get_LAB(tt));
+#endif
+#if 0
+    void *p = mem_alloc(100 M);
+    mem_tree_show(); mem_show();
+
+    void *q = mem_realloc(p, 1 G);
+    mem_tree_show(); mem_show();
+
+    /*void *pp = mem_alloc(8);
+    mem_tree_show();
+
+    mem_free(p);
+    mem_tree_show();
+
+    mem_free(q);
+    mem_tree_show();
+
+    void *ppp = mem_alloc(41);
+    mem_tree_show();
+
+    mem_realloc(ppp, 96);
+    mem_tree_show();*/
+#endif
+
+    tester(5 K, 1000);
     return 0;
+}
+
+static uint32_t checksum(void* ptr, size_t size) {
+    uint32_t crc = 0;
+    char* tmp_ptr = (char*)ptr;
+
+    for (size_t i = 0; i < size; i++) {
+        crc += *(tmp_ptr + i) * 211;
+    }
+
+    return crc;
+}
+
+static uint32_t fill_data(void* ptr, size_t size) {
+    uint32_t crc = 0;
+    char* tmp_ptr = (char*)ptr;
+
+    for (size_t i = 0; i < size; i++) {
+        *(tmp_ptr + i) = rand() % 255;
+        crc += *(tmp_ptr + i) * 211;
+    }
+
+    return crc;
+}
+
+static void tester(size_t random_mem, int iterations) {
+    mem_block test_arr[PTR_ARR_SIZE] = {};
+
+    for (int i = 0; i < iterations; i++) {
+        int rand_ptr = rand() % PTR_ARR_SIZE;
+
+        switch (rand() % 3) {
+        case 0: {
+            size_t mem = rand() % (random_mem + 1);
+            void* tmp = mem_alloc(mem);
+
+            if (tmp != NULL) {
+                test_arr[rand_ptr]._size = mem;
+                test_arr[rand_ptr]._ptr = tmp;
+                test_arr[rand_ptr]._checksum = fill_data(test_arr[rand_ptr]._ptr, test_arr[rand_ptr]._size);
+            }
+            break;
+        }
+
+        case 1: {
+            if (test_arr[rand_ptr]._ptr != NULL) {
+                uint32_t chck = checksum(test_arr[rand_ptr]._ptr, test_arr[rand_ptr]._size);
+                if (test_arr[rand_ptr]._checksum != chck) {
+                    printf("ERROR! INCORRECT CHECKSUM: \n%d -- %d\n", test_arr[rand_ptr]._checksum, chck);
+                    return;
+                }
+            }
+            mem_free(test_arr[rand_ptr]._ptr); 
+            test_arr[rand_ptr]._ptr = NULL;
+            break;
+        }
+
+        case 2: {
+            if (test_arr[rand_ptr]._ptr != NULL) {
+                uint32_t chck = checksum(test_arr[rand_ptr]._ptr, test_arr[rand_ptr]._size);
+                if (test_arr[rand_ptr]._checksum != chck) {
+                    printf("ERROR! INCORRECT CHECKSUM: \n%d -- %d\n", test_arr[rand_ptr]._checksum, chck);
+                    return;
+                }
+            }
+            size_t mem = rand() % (random_mem + 1);
+            void* tmp = mem_realloc(test_arr[rand_ptr]._ptr, mem);
+            if (tmp != NULL) {
+                test_arr[rand_ptr]._size = mem;
+                test_arr[rand_ptr]._ptr = tmp;
+                test_arr[rand_ptr]._checksum = fill_data(test_arr[rand_ptr]._ptr, test_arr[rand_ptr]._size);
+            }
+        }
+        }
+        if (i > iterations - 2) {
+            mem_tree_show();
+            mem_show();
+        }
+    }
 }
